@@ -84,7 +84,7 @@ Where `schema-payload.json` contains:
 ## Safety notes
 - Writes only to `wp-content/acf-json` by default.
 - Pull/push hash state now follows effective ACF schema resolution:
-  - first from `acf_get_setting('load_json')` JSON files (path order precedence)
+  - from `acf_get_setting('load_json')` JSON files, preferring the newest duplicate group by `modified` (then file mtime)
   - then DB-only field groups not present in JSON
 - Strict JSON mode is enabled by default (`acf_schema_api_strict_json_only`).
 - Push requests require signed headers by default (`acf_schema_api_require_signed_push`).

@@ -409,6 +409,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
         {
             $groups = array();
             $warnings = array();
+            $group_meta = array();
             $load_paths = self::get_load_json_paths($save_json_dir);
 
             foreach ($load_paths as $load_path) {
@@ -442,9 +443,23 @@ if (!class_exists('RG_ACF_Schema_API')) {
                         continue;
                     }
 
-                    // First-found key wins (ACF load_json path precedence).
+                    $candidate_meta = self::build_group_source_meta($decoded, $file_path);
                     if (!isset($groups[$group_key])) {
                         $groups[$group_key] = $decoded;
+                        $group_meta[$group_key] = $candidate_meta;
+                        continue;
+                    }
+
+                    $current_meta = $group_meta[$group_key];
+                    if (self::is_group_source_newer($candidate_meta, $current_meta)) {
+                        $warnings[] = sprintf(
+                            'Duplicate group key %s found in JSON paths; replacing older source with newer source (%s -> %s).',
+                            $group_key,
+                            $current_meta['source'],
+                            $candidate_meta['source']
+                        );
+                        $groups[$group_key] = $decoded;
+                        $group_meta[$group_key] = $candidate_meta;
                     }
                 }
             }
@@ -453,6 +468,57 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 'groups' => $groups,
                 'warnings' => $warnings,
             );
+        }
+
+        private static function build_group_source_meta($group, $source_path = '')
+        {
+            $source_mtime = 0;
+            if (is_string($source_path) && $source_path !== '') {
+                $mtime = @filemtime($source_path); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+                if (is_int($mtime) || (is_string($mtime) && preg_match('/^[0-9]+$/', $mtime))) {
+                    $source_mtime = (int) $mtime;
+                }
+            }
+
+            return array(
+                'modified' => self::extract_group_modified_timestamp($group),
+                'file_mtime' => $source_mtime,
+                'source' => (string) $source_path,
+            );
+        }
+
+        private static function extract_group_modified_timestamp($group)
+        {
+            if (!is_array($group) || !array_key_exists('modified', $group)) {
+                return 0;
+            }
+
+            $raw = $group['modified'];
+            if (is_int($raw) || is_float($raw)) {
+                return (int) $raw;
+            }
+            if (is_string($raw) && preg_match('/^-?[0-9]+$/', $raw)) {
+                return (int) $raw;
+            }
+
+            return 0;
+        }
+
+        private static function is_group_source_newer($candidate_meta, $current_meta)
+        {
+            $candidate_modified = isset($candidate_meta['modified']) ? (int) $candidate_meta['modified'] : 0;
+            $current_modified = isset($current_meta['modified']) ? (int) $current_meta['modified'] : 0;
+            if ($candidate_modified !== $current_modified) {
+                return $candidate_modified > $current_modified;
+            }
+
+            $candidate_mtime = isset($candidate_meta['file_mtime']) ? (int) $candidate_meta['file_mtime'] : 0;
+            $current_mtime = isset($current_meta['file_mtime']) ? (int) $current_meta['file_mtime'] : 0;
+            if ($candidate_mtime !== $current_mtime) {
+                return $candidate_mtime > $current_mtime;
+            }
+
+            return false;
         }
 
         private static function get_load_json_paths($save_json_dir)
