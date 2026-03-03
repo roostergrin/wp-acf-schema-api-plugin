@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
- * Version: 1.5.1
+ * Version: 1.5.5
  * Author: RG Ops
  */
 
@@ -22,7 +22,9 @@ if (!class_exists('RG_ACF_Schema_API')) {
         const OPTION_AUTOMATION_CLAIM_EXPIRES_AT = 'acf_automation_claim_expires_at';
         const OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES = 'acf_automation_allowed_resource_types';
         const OPTION_AUTOMATION_ENABLED = 'acf_automation_enabled';
+        const TRANSIENT_AUTOMATION_SECRET_PREVIEW = 'acf_automation_secret_preview';
         const CLAIM_TOKEN_TTL = DAY_IN_SECONDS;
+        const SECRET_PREVIEW_TTL = 900;
         const ADMIN_PAGE_SLUG = 'acf-codex-automation';
         const HEADER_AUTOMATION_SITE = 'x-acf-automation-site';
         const HEADER_AUTOMATION_SECRET = 'x-acf-automation-secret';
@@ -31,6 +33,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
         {
             add_action('rest_api_init', array(__CLASS__, 'register_routes'));
             add_action('admin_menu', array(__CLASS__, 'register_admin_page'));
+            add_filter('plugin_action_links_' . plugin_basename(__FILE__), array(__CLASS__, 'plugin_action_links'));
         }
 
         public static function register_routes()
@@ -234,12 +237,28 @@ if (!class_exists('RG_ACF_Schema_API')) {
         public static function register_admin_page()
         {
             add_options_page(
-                'Codex Automation',
-                'Codex Automation',
+                'AI Automation',
+                'AI Automation',
                 self::required_capability(),
                 self::ADMIN_PAGE_SLUG,
                 array(__CLASS__, 'render_admin_page')
             );
+        }
+
+        public static function plugin_action_links($links)
+        {
+            if (!current_user_can(self::required_capability())) {
+                return $links;
+            }
+
+            $settings_link = sprintf(
+                '<a href="%s">Settings</a>',
+                esc_url(admin_url('options-general.php?page=' . self::ADMIN_PAGE_SLUG))
+            );
+
+            array_unshift($links, $settings_link);
+
+            return $links;
         }
 
         public static function render_admin_page()
@@ -278,13 +297,22 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     $notice_type = 'notice-warning';
                 } elseif ($action === 'enable_automation') {
                     update_option(self::OPTION_AUTOMATION_ENABLED, true, false);
-                    $claim_token = self::maybe_issue_claim_token(true);
-                    $notice = 'Automation has been enabled.';
+                    $automation_secret = self::issue_automation_secret();
+                    $env_block = self::build_env_block($automation_secret);
+                    $notice = 'Automation has been enabled. Copy the .env block now; the secret is only shown once.';
                 }
             }
 
-            if ($claim_token === '' && !self::is_automation_claimed() && self::is_automation_enabled()) {
-                $claim_token = self::maybe_issue_claim_token(true);
+            if ($env_block === '') {
+                $preview_secret = self::get_automation_secret_preview();
+                if ($preview_secret !== '') {
+                    $env_block = self::build_env_block($preview_secret);
+                }
+            }
+
+            if ($env_block === '' && !self::is_automation_claimed() && self::is_automation_enabled()) {
+                $automation_secret = self::issue_automation_secret();
+                $env_block = self::build_env_block($automation_secret);
             }
 
             $status = self::build_bootstrap_status_payload(true, $claim_token);
@@ -295,12 +323,27 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     $status['claim_token']
                 );
             }
+            $env_placeholder_block = '';
+            if ($env_block === '' && $status['enabled']) {
+                $env_placeholder_block = self::build_env_block('<rotate-to-generate-new-secret>');
+            }
             ?>
             <div class="wrap">
-                <h1>Codex Automation</h1>
+                <h1>AI Automation</h1>
                 <?php if ($notice !== '') : ?>
                     <div class="notice <?php echo esc_attr($notice_type); ?> is-dismissible"><p><?php echo esc_html($notice); ?></p></div>
                 <?php endif; ?>
+
+                <?php if ($env_block !== '') : ?>
+                    <h2>Copy Into Your Repo <code>.env</code></h2>
+                    <p>This automation secret is shown only once. Paste it into the target repo root as <code>.env</code>.</p>
+                    <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_block); ?></textarea>
+                <?php elseif ($env_placeholder_block !== '') : ?>
+                    <h2>Repo <code>.env</code></h2>
+                    <p>Automation is already configured. The current secret cannot be shown again because only a hash is stored. Use <strong>Rotate Secret and Show New .env Block</strong> to generate a fresh real secret.</p>
+                    <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_placeholder_block); ?></textarea>
+                <?php endif; ?>
+
                 <table class="widefat striped" style="max-width: 960px;">
                     <tbody>
                         <tr><th>Status</th><td><?php echo esc_html($status['claimed'] ? 'Claimed' : 'Unclaimed'); ?></td></tr>
@@ -316,12 +359,6 @@ if (!class_exists('RG_ACF_Schema_API')) {
                         <?php endif; ?>
                     </tbody>
                 </table>
-
-                <?php if ($env_block !== '') : ?>
-                    <h2 style="margin-top: 20px;">Copy Into Your Repo <code>.env</code></h2>
-                    <p>This automation secret is shown only once. Paste it into the target repo root as <code>.env</code>.</p>
-                    <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_block); ?></textarea>
-                <?php endif; ?>
 
                 <form method="post" style="margin-top: 16px;">
                     <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
@@ -702,14 +739,22 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
             $secret = self::generate_secret(24);
             update_option(self::OPTION_AUTOMATION_SECRET_HASH, wp_hash_password($secret), false);
+            set_transient(self::TRANSIENT_AUTOMATION_SECRET_PREVIEW, $secret, self::SECRET_PREVIEW_TTL);
             self::clear_claim_token();
 
             return $secret;
         }
 
+        private static function get_automation_secret_preview()
+        {
+            $secret = get_transient(self::TRANSIENT_AUTOMATION_SECRET_PREVIEW);
+            return is_string($secret) ? trim($secret) : '';
+        }
+
         private static function clear_automation_secret()
         {
             delete_option(self::OPTION_AUTOMATION_SECRET_HASH);
+            delete_transient(self::TRANSIENT_AUTOMATION_SECRET_PREVIEW);
         }
 
         private static function maybe_issue_claim_token($force)
