@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
- * Version: 1.5.0
+ * Version: 1.5.1
  * Author: RG Ops
  */
 
@@ -253,18 +253,23 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $notice = '';
             $notice_type = 'updated';
             $claim_token = '';
+            $env_block = '';
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 check_admin_referer('acf_automation_admin_action', 'acf_automation_nonce');
                 $action = isset($_POST['acf_automation_action']) ? sanitize_key((string) $_POST['acf_automation_action']) : '';
 
-                if ($action === 'generate_claim_token') {
+                if ($action === 'generate_env_block') {
+                    $automation_secret = self::issue_automation_secret();
+                    $env_block = self::build_env_block($automation_secret);
+                    $notice = 'Generated a new automation secret. Copy the .env block now; the secret is only shown once.';
+                } elseif ($action === 'generate_claim_token') {
                     $claim_token = self::maybe_issue_claim_token(true);
                     $notice = 'Generated a new one-time claim token.';
                 } elseif ($action === 'rotate_secret') {
-                    self::clear_automation_secret();
-                    $claim_token = self::maybe_issue_claim_token(true);
-                    $notice = 'Rotated automation access. Previous automation secret is now invalid, and a new claim token has been issued.';
+                    $automation_secret = self::issue_automation_secret();
+                    $env_block = self::build_env_block($automation_secret);
+                    $notice = 'Rotated automation access. Previous automation secret is now invalid. Copy the new .env block now; the secret is only shown once.';
                 } elseif ($action === 'disable_automation') {
                     update_option(self::OPTION_AUTOMATION_ENABLED, false, false);
                     self::clear_automation_secret();
@@ -307,27 +312,38 @@ if (!class_exists('RG_ACF_Schema_API')) {
                         <tr><th>Content path</th><td><code><?php echo esc_html($status['content_base_path']); ?></code></td></tr>
                         <?php if (!empty($status['claim_token'])) : ?>
                             <tr><th>Claim token</th><td><code><?php echo esc_html($status['claim_token']); ?></code></td></tr>
-                            <tr><th>Claim command</th><td><code><?php echo esc_html($claim_command); ?></code></td></tr>
                             <tr><th>Expires at</th><td><code><?php echo esc_html($status['claim_expires_at']); ?></code></td></tr>
                         <?php endif; ?>
                     </tbody>
                 </table>
 
+                <?php if ($env_block !== '') : ?>
+                    <h2 style="margin-top: 20px;">Copy Into Your Repo <code>.env</code></h2>
+                    <p>This automation secret is shown only once. Paste it into the target repo root as <code>.env</code>.</p>
+                    <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_block); ?></textarea>
+                <?php endif; ?>
+
                 <form method="post" style="margin-top: 16px;">
                     <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
                     <?php if ($status['enabled']) : ?>
-                        <?php if ($status['claimed']) : ?>
-                            <input type="hidden" name="acf_automation_action" value="rotate_secret" />
-                            <?php submit_button('Rotate Automation Secret and Issue Claim Token', 'secondary', 'submit', false); ?>
-                        <?php else : ?>
-                            <input type="hidden" name="acf_automation_action" value="generate_claim_token" />
-                            <?php submit_button('Generate New Claim Token', 'secondary', 'submit', false); ?>
-                        <?php endif; ?>
+                        <input type="hidden" name="acf_automation_action" value="<?php echo esc_attr($status['claimed'] ? 'rotate_secret' : 'generate_env_block'); ?>" />
+                        <?php submit_button($status['claimed'] ? 'Rotate Secret and Show New .env Block' : 'Generate Copyable .env Block', 'primary', 'submit', false); ?>
                     <?php else : ?>
                         <input type="hidden" name="acf_automation_action" value="enable_automation" />
                         <?php submit_button('Enable Automation', 'primary', 'submit', false); ?>
                     <?php endif; ?>
                 </form>
+
+                <?php if ($status['enabled']) : ?>
+                    <form method="post" style="margin-top: 8px;">
+                        <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                        <input type="hidden" name="acf_automation_action" value="generate_claim_token" />
+                        <?php submit_button('Advanced: Generate CLI Claim Token', 'secondary', 'submit', false); ?>
+                    </form>
+                    <?php if ($claim_command !== '') : ?>
+                        <p><strong>Advanced CLI bootstrap:</strong> <code><?php echo esc_html($claim_command); ?></code></p>
+                    <?php endif; ?>
+                <?php endif; ?>
 
                 <form method="post" style="margin-top: 8px;">
                     <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
@@ -680,6 +696,17 @@ if (!class_exists('RG_ACF_Schema_API')) {
             delete_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT);
         }
 
+        private static function issue_automation_secret()
+        {
+            self::ensure_automation_defaults();
+
+            $secret = self::generate_secret(24);
+            update_option(self::OPTION_AUTOMATION_SECRET_HASH, wp_hash_password($secret), false);
+            self::clear_claim_token();
+
+            return $secret;
+        }
+
         private static function clear_automation_secret()
         {
             delete_option(self::OPTION_AUTOMATION_SECRET_HASH);
@@ -766,6 +793,25 @@ if (!class_exists('RG_ACF_Schema_API')) {
             }
 
             return $payload;
+        }
+
+        private static function build_env_block($automation_secret)
+        {
+            $status = self::build_bootstrap_status_payload(false, '');
+            $base_url = untrailingslashit((string) $status['target_base_url']);
+
+            return implode(
+                "\n",
+                array(
+                    'TARGET_BASE_URL=' . $base_url,
+                    'ACF_AUTOMATION_SITE_ID=' . (string) $status['site_id'],
+                    'ACF_AUTOMATION_SECRET=' . $automation_secret,
+                    'ACF_AUTOMATION_SCHEMA_PULL_PATH=' . (string) $status['schema_pull_path'],
+                    'ACF_AUTOMATION_SCHEMA_PUSH_PATH=' . (string) $status['schema_push_path'],
+                    'ACF_AUTOMATION_CONTENT_BASE_PATH=' . (string) $status['content_base_path'],
+                    'ALLOWED_RESOURCE_TYPES=' . implode(',', $status['allowed_resource_types']),
+                )
+            );
         }
 
         private static function resolve_allowed_resource_types()
