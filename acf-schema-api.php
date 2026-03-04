@@ -2,8 +2,13 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
- * Version: 1.5.8
+ * Version: 1.5.9
+ * Requires at least: 6.0
+ * Requires PHP: 7.4
  * Author: RG Ops
+ * Text Domain: acf-schema-api
+ * License: GPL-2.0-or-later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  */
 
 if (!defined('ABSPATH')) {
@@ -87,6 +92,11 @@ if (!class_exists('RG_ACF_Schema_API')) {
                             'type' => 'boolean',
                             'required' => false,
                             'default' => false,
+                        ),
+                        'suppress_legacy_build_hooks' => array(
+                            'type' => 'boolean',
+                            'required' => false,
+                            'default' => true,
                         ),
                     ),
                 )
@@ -1315,6 +1325,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $incoming_map = $validated;
             $allow_field_key_changes = (bool) $request->get_param('allow_field_key_changes');
             $delete_missing_groups = (bool) $request->get_param('delete_missing_groups');
+            $suppress_legacy_build_hooks = (bool) $request->get_param('suppress_legacy_build_hooks');
 
             $duplicate_errors = self::validate_no_duplicate_sibling_field_names($incoming_map);
             if (!empty($duplicate_errors)) {
@@ -1352,6 +1363,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 'dry_run' => $dry_run,
                 'allow_field_key_changes' => $allow_field_key_changes,
                 'delete_missing_groups' => $delete_missing_groups,
+                'suppress_legacy_build_hooks' => $suppress_legacy_build_hooks,
                 'plan' => $plan,
                 'source_counts' => $state['source_counts'],
                 'signature_required' => !empty($signature_state['required']),
@@ -1418,33 +1430,43 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 );
             }
 
-            if (self::should_import_groups_to_db()) {
-                $import_report = self::maybe_import_groups_to_db($incoming_map, $plan);
-            } else {
-                $import_report = array(
-                    'attempted' => 0,
-                    'imported' => 0,
-                    'skipped' => count($plan['create']) + count($plan['update']),
-                    'errors' => array(),
-                    'mode' => 'skipped',
-                    'reason' => 'DB import disabled by default. Enable with acf_schema_api_import_to_db filter.',
-                );
-            }
+            $import_to_db = self::should_import_groups_to_db();
+            $legacy_build_hook_guard = self::begin_legacy_build_hook_guard(
+                $suppress_legacy_build_hooks,
+                ($import_to_db || $delete_missing_groups)
+            );
 
-            if ($delete_missing_groups) {
-                $db_delete_report = self::maybe_delete_groups_from_db($plan['removed']);
-            } else {
-                $db_delete_report = array(
-                    'requested' => false,
-                    'attempted' => 0,
-                    'deleted' => 0,
-                    'missing' => 0,
-                    'errors' => array(),
-                    'keys' => array(),
-                    'missing_keys' => array(),
-                    'mode' => 'skipped',
-                    'reason' => 'DB deletion runs only when delete_missing_groups=true.',
-                );
+            try {
+                if ($import_to_db) {
+                    $import_report = self::maybe_import_groups_to_db($incoming_map, $plan);
+                } else {
+                    $import_report = array(
+                        'attempted' => 0,
+                        'imported' => 0,
+                        'skipped' => count($plan['create']) + count($plan['update']),
+                        'errors' => array(),
+                        'mode' => 'skipped',
+                        'reason' => 'DB import disabled by default. Enable with acf_schema_api_import_to_db filter.',
+                    );
+                }
+
+                if ($delete_missing_groups) {
+                    $db_delete_report = self::maybe_delete_groups_from_db($plan['removed']);
+                } else {
+                    $db_delete_report = array(
+                        'requested' => false,
+                        'attempted' => 0,
+                        'deleted' => 0,
+                        'missing' => 0,
+                        'errors' => array(),
+                        'keys' => array(),
+                        'missing_keys' => array(),
+                        'mode' => 'skipped',
+                        'reason' => 'DB deletion runs only when delete_missing_groups=true.',
+                    );
+                }
+            } finally {
+                self::restore_legacy_build_hook_guard($legacy_build_hook_guard);
             }
 
             if (!empty($db_delete_report['errors'])) {
@@ -1469,6 +1491,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $result['import_report'] = $import_report;
             $result['delete_report'] = $delete_report;
             $result['db_delete_report'] = $db_delete_report;
+            $result['legacy_build_hook_guard'] = self::summarize_legacy_build_hook_guard($legacy_build_hook_guard);
             $result['source_counts_after'] = $refreshed['source_counts'];
             if (!empty($refreshed['warnings'])) {
                 $result['warnings_after'] = $refreshed['warnings'];
@@ -1981,6 +2004,299 @@ if (!class_exists('RG_ACF_Schema_API')) {
         private static function should_import_groups_to_db()
         {
             return (bool) apply_filters('acf_schema_api_import_to_db', false);
+        }
+
+        private static function should_suppress_legacy_build_hooks()
+        {
+            return (bool) apply_filters('acf_schema_api_suppress_legacy_build_hooks', true);
+        }
+
+        private static function begin_legacy_build_hook_guard($requested, $has_db_operations)
+        {
+            $guard = array(
+                'requested' => (bool) $requested,
+                'has_db_operations' => (bool) $has_db_operations,
+                'enabled' => false,
+                'reason' => '',
+                'removed_count' => 0,
+                'restored_count' => 0,
+                'removed_callbacks' => array(),
+                'restore_errors' => array(),
+            );
+
+            if (!$guard['requested']) {
+                $guard['reason'] = 'disabled_by_request';
+                return $guard;
+            }
+
+            if (!$guard['has_db_operations']) {
+                $guard['reason'] = 'no_db_operations';
+                return $guard;
+            }
+
+            if (!self::should_suppress_legacy_build_hooks()) {
+                $guard['reason'] = 'disabled_by_filter';
+                return $guard;
+            }
+
+            $guard['enabled'] = true;
+            $hooks = array('save_post', 'save_post_acf-field-group', 'save_post_acf-field');
+            foreach ($hooks as $hook) {
+                if (!isset($GLOBALS['wp_filter'][$hook]) || !($GLOBALS['wp_filter'][$hook] instanceof WP_Hook)) {
+                    continue;
+                }
+
+                $hook_object = $GLOBALS['wp_filter'][$hook];
+                if (!isset($hook_object->callbacks) || !is_array($hook_object->callbacks) || empty($hook_object->callbacks)) {
+                    continue;
+                }
+
+                $callbacks_snapshot = $hook_object->callbacks;
+                foreach ($callbacks_snapshot as $priority => $callbacks) {
+                    foreach ($callbacks as $callback_data) {
+                        if (!isset($callback_data['function'])) {
+                            continue;
+                        }
+
+                        $callback = $callback_data['function'];
+                        $match = self::is_legacy_build_save_post_callback($callback, $hook);
+                        if (!$match['match']) {
+                            continue;
+                        }
+
+                        $accepted_args = isset($callback_data['accepted_args']) ? (int) $callback_data['accepted_args'] : 1;
+                        if (!remove_action($hook, $callback, (int) $priority)) {
+                            continue;
+                        }
+
+                        $guard['removed_count']++;
+                        $guard['removed_callbacks'][] = array(
+                            'hook' => $hook,
+                            'priority' => (int) $priority,
+                            'accepted_args' => $accepted_args,
+                            'callback' => $callback,
+                            'callback_label' => $match['meta']['callback'],
+                            'source_file' => $match['meta']['source_file'],
+                            'reason' => $match['meta']['reason'],
+                        );
+                    }
+                }
+            }
+
+            return $guard;
+        }
+
+        private static function restore_legacy_build_hook_guard(&$guard)
+        {
+            if (empty($guard['removed_callbacks']) || !is_array($guard['removed_callbacks'])) {
+                return;
+            }
+
+            foreach ($guard['removed_callbacks'] as $callback_data) {
+                try {
+                    add_action(
+                        $callback_data['hook'],
+                        $callback_data['callback'],
+                        (int) $callback_data['priority'],
+                        (int) $callback_data['accepted_args']
+                    );
+                    $guard['restored_count']++;
+                } catch (Throwable $e) {
+                    $guard['restore_errors'][] = sprintf(
+                        'Failed restoring %s on %s: %s',
+                        $callback_data['callback_label'],
+                        $callback_data['hook'],
+                        $e->getMessage()
+                    );
+                }
+            }
+        }
+
+        private static function summarize_legacy_build_hook_guard($guard)
+        {
+            $summary = array(
+                'requested' => !empty($guard['requested']),
+                'has_db_operations' => !empty($guard['has_db_operations']),
+                'enabled' => !empty($guard['enabled']),
+                'removed_count' => isset($guard['removed_count']) ? (int) $guard['removed_count'] : 0,
+                'restored_count' => isset($guard['restored_count']) ? (int) $guard['restored_count'] : 0,
+            );
+
+            if (!empty($guard['reason'])) {
+                $summary['reason'] = (string) $guard['reason'];
+            }
+
+            if (!empty($guard['removed_callbacks']) && is_array($guard['removed_callbacks'])) {
+                $summary['removed_callbacks'] = array();
+                foreach ($guard['removed_callbacks'] as $callback_data) {
+                    $summary['removed_callbacks'][] = array(
+                        'hook' => $callback_data['hook'],
+                        'priority' => (int) $callback_data['priority'],
+                        'callback' => $callback_data['callback_label'],
+                        'source_file' => $callback_data['source_file'],
+                        'reason' => $callback_data['reason'],
+                    );
+                }
+            }
+
+            if (!empty($guard['restore_errors']) && is_array($guard['restore_errors'])) {
+                $summary['restore_errors'] = array_values($guard['restore_errors']);
+            }
+
+            return $summary;
+        }
+
+        private static function is_legacy_build_save_post_callback($callback, $hook)
+        {
+            $meta = array(
+                'hook' => (string) $hook,
+                'callback' => self::describe_callable($callback),
+                'source_file' => '',
+                'reason' => '',
+            );
+
+            $source = self::get_callback_source_meta($callback);
+            $source_file = '';
+            if (!empty($source['file'])) {
+                $source_file = wp_normalize_path((string) $source['file']);
+                $meta['source_file'] = $source_file;
+            }
+
+            $is_match = false;
+            if ($meta['callback'] === 'my_project_updated_trigger_generate') {
+                $is_match = true;
+                $meta['reason'] = 'legacy_callback_name';
+            } elseif ($source_file !== '' && preg_match('#/functions/run-build\.php$#i', $source_file)) {
+                $is_match = true;
+                $meta['reason'] = 'run_build_source_file';
+            } elseif ($source_file !== '' && preg_match('#/themes/[^/]+/functions\.php$#i', $source_file)) {
+                $snippet = strtolower((string) $source['snippet']);
+                if (strpos($snippet, 'codepipelineclient') !== false || strpos($snippet, 'startpipelineexecution') !== false) {
+                    $is_match = true;
+                    $meta['reason'] = 'functions_php_codepipeline';
+                }
+            }
+
+            $is_match = (bool) apply_filters('acf_schema_api_match_legacy_build_callback', $is_match, $callback, $meta);
+            return array(
+                'match' => $is_match,
+                'meta' => $meta,
+            );
+        }
+
+        private static function describe_callable($callback)
+        {
+            if (is_string($callback)) {
+                return $callback;
+            }
+
+            if ($callback instanceof Closure) {
+                return 'closure';
+            }
+
+            if (is_array($callback) && count($callback) === 2) {
+                $target = $callback[0];
+                $method = (string) $callback[1];
+                if (is_object($target)) {
+                    return get_class($target) . '::' . $method;
+                }
+
+                if (is_string($target)) {
+                    return $target . '::' . $method;
+                }
+            }
+
+            if (is_object($callback) && method_exists($callback, '__invoke')) {
+                return get_class($callback) . '::__invoke';
+            }
+
+            return 'callable';
+        }
+
+        private static function get_callback_source_meta($callback)
+        {
+            $meta = array(
+                'file' => '',
+                'start_line' => 0,
+                'end_line' => 0,
+                'snippet' => '',
+            );
+
+            try {
+                $reflection = null;
+                if ($callback instanceof Closure) {
+                    $reflection = new ReflectionFunction($callback);
+                } elseif (is_string($callback)) {
+                    if (!function_exists($callback)) {
+                        return $meta;
+                    }
+                    $reflection = new ReflectionFunction($callback);
+                } elseif (is_array($callback) && count($callback) === 2) {
+                    $target = $callback[0];
+                    $method = (string) $callback[1];
+                    if (!method_exists($target, $method)) {
+                        return $meta;
+                    }
+                    $reflection = new ReflectionMethod($target, $method);
+                } elseif (is_object($callback) && method_exists($callback, '__invoke')) {
+                    $reflection = new ReflectionMethod($callback, '__invoke');
+                }
+
+                if (!$reflection) {
+                    return $meta;
+                }
+
+                $file = $reflection->getFileName();
+                if (!is_string($file) || $file === '') {
+                    return $meta;
+                }
+
+                $start_line = (int) $reflection->getStartLine();
+                $end_line = (int) $reflection->getEndLine();
+                if ($start_line <= 0 || $end_line < $start_line) {
+                    $start_line = 0;
+                    $end_line = 0;
+                }
+
+                $meta['file'] = $file;
+                $meta['start_line'] = $start_line;
+                $meta['end_line'] = $end_line;
+                $meta['snippet'] = self::read_file_lines($file, $start_line, $end_line);
+            } catch (Throwable $e) {
+                return $meta;
+            }
+
+            return $meta;
+        }
+
+        private static function read_file_lines($file, $start_line, $end_line)
+        {
+            if (!is_string($file) || $file === '' || !is_readable($file)) {
+                return '';
+            }
+
+            $start_line = (int) $start_line;
+            $end_line = (int) $end_line;
+            if ($start_line <= 0 || $end_line < $start_line) {
+                return '';
+            }
+
+            $max_lines = 200;
+            if (($end_line - $start_line + 1) > $max_lines) {
+                $end_line = $start_line + $max_lines - 1;
+            }
+
+            $lines = file($file, FILE_IGNORE_NEW_LINES);
+            if (!is_array($lines) || empty($lines)) {
+                return '';
+            }
+
+            $slice = array_slice($lines, $start_line - 1, $end_line - $start_line + 1);
+            if (empty($slice)) {
+                return '';
+            }
+
+            return implode("\n", $slice);
         }
 
         private static function resolve_hmac_secret()

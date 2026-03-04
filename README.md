@@ -23,6 +23,8 @@ Build a deployable WordPress plugin zip locally:
 ./scripts/build-zip.sh
 ```
 
+The script validates that the plugin header `Version` matches `readme.txt` `Stable tag` before packaging.
+
 This writes:
 - `dist/acf-schema-api-<version>.zip`
 - `dist/acf-schema-api.zip`
@@ -60,6 +62,7 @@ curl --user "wp_user:app_password" \
 `expected_hash` is optional but recommended for optimistic locking.
 `allow_field_key_changes` defaults to `false`.
 `delete_missing_groups` defaults to `false` (when `true`, deletes groups not present in payload from JSON and ACF DB).
+`suppress_legacy_build_hooks` defaults to `true` (temporarily suppresses legacy `save_post` pipeline hooks during DB import/delete apply).
 
 ```bash
 curl --user "wp_user:app_password" \
@@ -70,6 +73,7 @@ curl --user "wp_user:app_password" \
     "dry_run": true,
     "allow_field_key_changes": false,
     "delete_missing_groups": false,
+    "suppress_legacy_build_hooks": true,
     "field_groups": [
       {
         "key": "group_abc123",
@@ -97,6 +101,7 @@ Where `schema-payload.json` contains:
   "dry_run": false,
   "allow_field_key_changes": false,
   "delete_missing_groups": false,
+  "suppress_legacy_build_hooks": true,
   "field_groups": [
     {
       "key": "group_abc123",
@@ -117,6 +122,7 @@ Where `schema-payload.json` contains:
 - Optional auto-heal: enable auto-export from `Settings > AI Automation`, or override it with `acf_schema_api_auto_export_db_only_groups`, to export DB-only groups automatically during pull/push before strict mode fails.
 - Push requests rely on authenticated WordPress users with the required capability by default.
 - Signed push headers are optional and can be re-enabled with `acf_schema_api_require_signed_push`.
+- During push apply, legacy `save_post` build triggers from old themes (for example callbacks from `functions/run-build.php`) are suppressed by default so schema deploy does not auto-run frontend build pipelines.
 - Validates group keys as `group_*`.
 - Validates nested field keys as `field_*`.
 - Fails on duplicate sibling field names at any nesting level.
@@ -148,6 +154,8 @@ Route for push:
 - `acf_schema_api_json_dir` (default `WP_CONTENT_DIR . '/acf-json'`)
 - `acf_schema_api_auto_export_db_only_groups` (default `false`)
 - `acf_schema_api_require_signed_push` (default `false`)
+- `acf_schema_api_suppress_legacy_build_hooks` (default `true`)
+- `acf_schema_api_match_legacy_build_callback` (default matcher targets known legacy CodePipeline callbacks)
 
 ## Local test script
 Use `test-schema-api.sh` for pull + push dry-run verification.
